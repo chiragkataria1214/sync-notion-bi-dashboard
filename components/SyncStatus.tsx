@@ -32,29 +32,18 @@ export default function SyncStatus({ data }: SyncStatusProps) {
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - 30);
-    
+
     setTimeDoctorEndDate(endDate.toISOString().split('T')[0]);
     setTimeDoctorStartDate(startDate.toISOString().split('T')[0]);
   }, []);
 
   useEffect(() => {
-    // Fetch clients
-    console.log('[DEBUG] Fetching clients from /api/clients...');
+    // Fetch clients from MongoDB
     fetch('/api/clients')
-      .then(res => {
-        console.log('[DEBUG] Response status:', res.status);
-        return res.json();
-      })
+      .then(res => res.json())
       .then(data => {
-        console.log('[DEBUG] Clients data received:', data);
-        console.log('[DEBUG] Clients array:', data.clients);
-        console.log('[DEBUG] Clients count:', data.clients?.length || 0);
         setClients(data.clients || []);
         setDebugInfo(data.debug || null);
-        
-        if (!data.clients || data.clients.length === 0) {
-          console.warn('[DEBUG] No clients found! Debug info:', data.debug);
-        }
       })
       .catch(err => {
         console.error('[ERROR] Error fetching clients:', err);
@@ -79,37 +68,34 @@ export default function SyncStatus({ data }: SyncStatusProps) {
         body.client_id = selectedClient;
         body.type = 'projects'; // Only sync projects when client is selected
       }
-      
+
       // Add test limit if enabled
       if (useLimit && testLimit > 0) {
         body.limit = testLimit;
       }
-      
+
       setSyncProgress(`Syncing from Notion${useLimit && testLimit ? ` (limit: ${testLimit})` : ''}...`);
       const response = await fetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      
+
       const result = await response.json();
       console.log('[SYNC] Sync result:', result);
-      
+
       if (result.success) {
         setSyncProgress(
           `Sync completed! ` +
-          `${result.clients?.records_processed || 0} clients, ` +
+          `${result.clients?.processed || 0} clients, ` +
           `${result.projects?.processed || 0} projects, ` +
-          `${result.team_members?.records_processed || 0} team members, ` +
+          `${result.team_members?.processed || 0} team members, ` +
           `${result.qi_time_tracker?.processed || 0} QI Time Tracker entries`
         );
       } else {
         setSyncProgress(`Sync failed: ${result.error}`);
       }
-      
-      setTimeout(() => {
-        window.location.reload();
-      }, 3000);
+      setSyncing(false);
     } catch (error: any) {
       console.error('Sync error:', error);
       setSyncProgress(`Error: ${error.message}`);
@@ -122,25 +108,25 @@ export default function SyncStatus({ data }: SyncStatusProps) {
     setTimeDoctorProgress('Starting Time Doctor sync...');
     try {
       const body: any = {};
-      
+
       if (timeDoctorStartDate) {
         body.start_date = timeDoctorStartDate;
       }
       if (timeDoctorEndDate) {
         body.end_date = timeDoctorEndDate;
       }
-      
+
       setTimeDoctorProgress(`Syncing Time Doctor data${timeDoctorStartDate && timeDoctorEndDate ? ` from ${timeDoctorStartDate} to ${timeDoctorEndDate}` : ' (last 30 days)'}...`);
-      
+
       const response = await fetch('/api/timedoctor/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      
+
       const contentType = response.headers.get('content-type');
       const isJson = contentType && contentType.includes('application/json');
-      
+
       if (!response.ok) {
         let errorText: string;
         if (isJson) {
@@ -159,15 +145,15 @@ export default function SyncStatus({ data }: SyncStatusProps) {
         }
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
-      
+
       if (!isJson) {
         const text = await response.text();
         throw new Error(`Expected JSON but got ${contentType}. Response: ${text.substring(0, 200)}`);
       }
-      
+
       const result = await response.json();
       console.log('[TIMEDOCTOR SYNC] Sync result:', result);
-      
+
       if (result.success) {
         const { users, projects, worklogs } = result.result || {};
         setTimeDoctorProgress(
@@ -179,10 +165,7 @@ export default function SyncStatus({ data }: SyncStatusProps) {
       } else {
         setTimeDoctorProgress(`Time Doctor sync failed: ${result.error || 'Unknown error'}`);
       }
-      
-      setTimeout(() => {
-        window.location.reload();
-      }, 3000);
+      setSyncingTimeDoctor(false);
     } catch (error: any) {
       console.error('Time Doctor sync error:', error);
       setTimeDoctorProgress(`Error: ${error.message}`);
@@ -195,16 +178,16 @@ export default function SyncStatus({ data }: SyncStatusProps) {
     setQiTimeTrackerProgress('Starting QI Time Tracker sync...');
     try {
       setQiTimeTrackerProgress('Syncing QI Time Tracker entries from Notion...');
-      
+
       const response = await fetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'qi_time_tracker' })
       });
-      
+
       const result = await response.json();
       console.log('[QI TIME TRACKER SYNC] Sync result:', result);
-      
+
       if (result.success) {
         const qiTimeTracker = result.qi_time_tracker || {};
         setQiTimeTrackerProgress(
@@ -216,10 +199,7 @@ export default function SyncStatus({ data }: SyncStatusProps) {
       } else {
         setQiTimeTrackerProgress(`QI Time Tracker sync failed: ${result.error || 'Unknown error'}`);
       }
-      
-      setTimeout(() => {
-        window.location.reload();
-      }, 3000);
+      setSyncingQITimeTracker(false);
     } catch (error: any) {
       console.error('QI Time Tracker sync error:', error);
       setQiTimeTrackerProgress(`Error: ${error.message}`);
@@ -232,31 +212,33 @@ export default function SyncStatus({ data }: SyncStatusProps) {
     setClientsProgress('Starting Clients sync...');
     try {
       setClientsProgress('Syncing clients from Notion...');
-      
+
       const response = await fetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'clients' })
       });
-      
+
       const result = await response.json();
       console.log('[CLIENTS SYNC] Sync result:', result);
-      
+
       if (result.success) {
         const clients = result.clients || {};
         setClientsProgress(
           `Clients sync completed! ` +
-          `${clients.records_processed || 0} clients processed, ` +
-          `${clients.records_failed || 0} failed. ` +
+          `${clients.processed || 0} clients processed, ` +
+          `${clients.failed || 0} failed. ` +
           `Status: ${clients.status || 'unknown'}`
         );
+        // Refresh client list
+        fetch('/api/clients')
+          .then(res => res.json())
+          .then(data => setClients(data.clients || []))
+          .catch(err => console.error('Error refreshing clients:', err));
       } else {
         setClientsProgress(`Clients sync failed: ${result.error || 'Unknown error'}`);
       }
-      
-      setTimeout(() => {
-        window.location.reload();
-      }, 3000);
+      setSyncingClients(false);
     } catch (error: any) {
       console.error('Clients sync error:', error);
       setClientsProgress(`Error: ${error.message}`);
@@ -269,31 +251,28 @@ export default function SyncStatus({ data }: SyncStatusProps) {
     setTeamMembersProgress('Starting Team Members sync...');
     try {
       setTeamMembersProgress('Syncing team members from Notion...');
-      
+
       const response = await fetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'team_members' })
       });
-      
+
       const result = await response.json();
       console.log('[TEAM MEMBERS SYNC] Sync result:', result);
-      
+
       if (result.success) {
         const teamMembers = result.team_members || {};
         setTeamMembersProgress(
           `Team Members sync completed! ` +
-          `${teamMembers.records_processed || 0} team members processed, ` +
-          `${teamMembers.records_failed || 0} failed. ` +
+          `${teamMembers.processed || 0} team members processed, ` +
+          `${teamMembers.failed || 0} failed. ` +
           `Status: ${teamMembers.status || 'unknown'}`
         );
       } else {
         setTeamMembersProgress(`Team Members sync failed: ${result.error || 'Unknown error'}`);
       }
-      
-      setTimeout(() => {
-        window.location.reload();
-      }, 3000);
+      setSyncingTeamMembers(false);
     } catch (error: any) {
       console.error('Team Members sync error:', error);
       setTeamMembersProgress(`Error: ${error.message}`);
@@ -325,33 +304,33 @@ export default function SyncStatus({ data }: SyncStatusProps) {
             )}
           </div>
         </div>
-        
+
         <div className="space-y-4">
           <div>
-              <label className="block text-sm font-medium mb-2 text-gray-900">
-                Sync Options: 
-                <span className="ml-2 text-xs text-gray-700">
-                  ({clients.length} client{clients.length !== 1 ? 's' : ''} found)
-                </span>
-              </label>
-              <select
-                value={selectedClient}
-                onChange={(e) => setSelectedClient(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 bg-white"
-                disabled={syncing}
-              >
-                <option value="all">All Clients</option>
-                {clients.length === 0 && (
-                  <option value="" disabled>No clients found - Run sync first</option>
-                )}
-                {clients.map((client: any) => (
-                  <option key={client.client_id} value={client.client_id}>
-                    {client.name || 'Unknown'} ({client.project_count || 0} projects)
-                  </option>
-                ))}
-              </select>
+            <label className="block text-sm font-medium mb-2 text-gray-900">
+              Sync Options:
+              <span className="ml-2 text-xs text-gray-700">
+                ({clients.length} client{clients.length !== 1 ? 's' : ''} found)
+              </span>
+            </label>
+            <select
+              value={selectedClient}
+              onChange={(e) => setSelectedClient(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 bg-white"
+              disabled={syncing}
+            >
+              <option value="all">All Clients</option>
+              {clients.length === 0 && (
+                <option value="" disabled>No clients found - Run sync first</option>
+              )}
+              {clients.map((client: any) => (
+                <option key={client.client_id} value={client.client_id}>
+                  {client.name || 'Unknown'} ({client.project_count || 0} projects)
+                </option>
+              ))}
+            </select>
           </div>
-          
+
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
               <input
@@ -380,7 +359,7 @@ export default function SyncStatus({ data }: SyncStatusProps) {
               (for testing - leave unchecked for full sync)
             </span>
           </div>
-          
+
           <div className="flex gap-2">
             <button
               onClick={async () => {
@@ -403,11 +382,10 @@ export default function SyncStatus({ data }: SyncStatusProps) {
             <button
               onClick={handleSync}
               disabled={syncing}
-              className={`px-6 py-2 rounded font-medium ${
-                syncing
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-blue-500 hover:bg-blue-600 text-white'
-              }`}
+              className={`px-6 py-2 rounded font-medium ${syncing
+                ? 'bg-gray-400 cursor-not-allowed'
+                : 'bg-blue-500 hover:bg-blue-600 text-white'
+                }`}
             >
               {syncing ? 'Syncing...' : 'Sync Now'}
             </button>
@@ -418,7 +396,7 @@ export default function SyncStatus({ data }: SyncStatusProps) {
             </div>
           )}
         </div>
-        
+
         {showDebug && debugInfo && (
           <div className="mt-4 p-4 bg-gray-50 rounded border border-gray-200">
             <h3 className="font-semibold mb-2 text-gray-900">Debug Information:</h3>
@@ -431,7 +409,7 @@ export default function SyncStatus({ data }: SyncStatusProps) {
             </div>
           </div>
         )}
-        
+
         {showDebug && clients.length === 0 && (
           <div className="mt-4 p-4 bg-yellow-50 rounded border border-yellow-200">
             <h3 className="font-semibold mb-2 text-yellow-800">No Clients Found</h3>
@@ -483,11 +461,10 @@ export default function SyncStatus({ data }: SyncStatusProps) {
               <button
                 onClick={handleTimeDoctorSync}
                 disabled={syncingTimeDoctor}
-                className={`px-6 py-2 rounded font-medium ${
-                  syncingTimeDoctor
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : 'bg-purple-500 hover:bg-purple-600 text-white'
-                }`}
+                className={`px-6 py-2 rounded font-medium ${syncingTimeDoctor
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-purple-500 hover:bg-purple-600 text-white'
+                  }`}
               >
                 {syncingTimeDoctor ? 'Syncing Time Doctor...' : 'Sync Time Doctor'}
               </button>
@@ -511,11 +488,10 @@ export default function SyncStatus({ data }: SyncStatusProps) {
               <button
                 onClick={handleClientsSync}
                 disabled={syncingClients}
-                className={`px-6 py-2 rounded font-medium ${
-                  syncingClients
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : 'bg-teal-500 hover:bg-teal-600 text-white'
-                }`}
+                className={`px-6 py-2 rounded font-medium ${syncingClients
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-teal-500 hover:bg-teal-600 text-white'
+                  }`}
               >
                 {syncingClients ? 'Syncing Clients...' : 'Sync Clients'}
               </button>
@@ -539,11 +515,10 @@ export default function SyncStatus({ data }: SyncStatusProps) {
               <button
                 onClick={handleTeamMembersSync}
                 disabled={syncingTeamMembers}
-                className={`px-6 py-2 rounded font-medium ${
-                  syncingTeamMembers
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : 'bg-indigo-500 hover:bg-indigo-600 text-white'
-                }`}
+                className={`px-6 py-2 rounded font-medium ${syncingTeamMembers
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-indigo-500 hover:bg-indigo-600 text-white'
+                  }`}
               >
                 {syncingTeamMembers ? 'Syncing Team Members...' : 'Sync Team Members'}
               </button>
@@ -567,11 +542,10 @@ export default function SyncStatus({ data }: SyncStatusProps) {
               <button
                 onClick={handleQITimeTrackerSync}
                 disabled={syncingQITimeTracker}
-                className={`px-6 py-2 rounded font-medium ${
-                  syncingQITimeTracker
-                    ? 'bg-gray-400 cursor-not-allowed'
-                    : 'bg-green-500 hover:bg-green-600 text-white'
-                }`}
+                className={`px-6 py-2 rounded font-medium ${syncingQITimeTracker
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-green-500 hover:bg-green-600 text-white'
+                  }`}
               >
                 {syncingQITimeTracker ? 'Syncing QI Time Tracker...' : 'Sync QI Time Tracker'}
               </button>
