@@ -33,18 +33,25 @@ export interface Card {
     created_time?: Date;
     last_updated?: Date;
     
-    // People Assignments (arrays of Notion User IDs)
-    account_manager_ids?: string[];
-    developer_ids?: string[];
-    lead_developer_ids?: string[];
-    quality_inspector_ids?: string[];
-    designer_ids?: string[];
-    // Alternative field names (arrays of Notion User IDs)
+    // People Assignments - Team Member page IDs from relation properties
+    // Use team_members collection to resolve Team Member page IDs to user info
+    account_manager_ids?: string[]; // Team Member page IDs
+    developer_ids?: string[]; // Team Member page IDs
+    lead_developer_ids?: string[]; // Team Member page IDs
+    quality_inspector_ids?: string[]; // Team Member page IDs
+    designer_ids?: string[]; // Team Member page IDs
+    // Alternative field names (same as above)
     account_manager?: string[];
     developer?: string[];
     lead_developer?: string[];
     quality_inspector?: string[];
     designer?: string[];
+    // Team member names (resolved during sync for convenience)
+    developer_names?: string[];
+    lead_developer_names?: string[];
+    account_manager_names?: string[];
+    quality_inspector_names?: string[];
+    designer_names?: string[];
     
     // Pushbacks
     pushback_count?: number; // Number of times pushed to QI (from "Push Back Count" property)
@@ -127,8 +134,8 @@ export interface Card {
 
 export interface TeamMember {
   _id?: string;
-  notion_id?: string;
-  notion_user_id?: string; // Notion user ID for mapping people properties
+  notion_id?: string; // Team Member page ID (primary identifier)
+  notion_user_id?: string; // Notion user ID (optional, for backward compatibility with people properties)
   name: string;
   email?: string;
   role?: string; // Position
@@ -226,7 +233,7 @@ export interface SyncLog {
 export interface TimeDoctorUser {
   _id?: string;
   time_doctor_id: string; // Time Doctor user ID
-  notion_user_id?: string; // Matched Notion team member ID
+  team_member_page_id?: string; // Team Member page ID (notion_id from team_members collection)
   name: string;
   email?: string;
   role?: string;
@@ -254,7 +261,7 @@ export interface TimeDoctorWorklog {
   time_doctor_id?: string; // Time Doctor worklog entry ID
   time_doctor_user_id: string; // Time Doctor user ID
   time_doctor_project_id: string; // Time Doctor project ID
-  notion_user_id?: string; // Matched Notion team member ID
+  team_member_page_id?: string; // Team Member page ID (notion_id from team_members collection)
   notion_card_id?: string; // Matched Notion card ID
   notion_client_id?: string; // Matched Notion client ID
   date: Date; // Date of work

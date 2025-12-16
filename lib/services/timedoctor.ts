@@ -395,12 +395,13 @@ export async function fetchTimeDoctorWorklogs(
 
 /**
  * Match Time Doctor users to Notion team members
+ * Returns mapping of TD User ID -> Team Member page ID (notion_id)
  */
 async function matchTimeDoctorUsers(
   tdUsers: TimeDoctorApiUser[],
   teamMembers: TeamMember[]
 ): Promise<Map<string, string>> {
-  const matchMap = new Map<string, string>(); // TD User ID -> Notion User ID
+  const matchMap = new Map<string, string>(); // TD User ID -> Team Member page ID (notion_id)
 
   const teamMemberByEmail = new Map<string, TeamMember>();
   const teamMemberByName = new Map<string, TeamMember>();
@@ -418,17 +419,20 @@ async function matchTimeDoctorUsers(
     if (tdUser.email) {
       const matched = teamMemberByEmail.get(tdUser.email.toLowerCase().trim());
       if (matched && matched.notion_id) {
+        // Store Team Member page ID (notion_id from Team Members database)
         matchMap.set(tdUser.id, matched.notion_id);
       }
     }
     if (!matchMap.has(tdUser.id) && tdUser.name) {
       const matched = teamMemberByName.get(tdUser.name.toLowerCase().trim());
       if (matched && matched.notion_id) {
+        // Store Team Member page ID (notion_id from Team Members database)
         matchMap.set(tdUser.id, matched.notion_id);
       }
     }
   });
 
+  console.log(`[TIMEDOCTOR] Matched ${matchMap.size} out of ${tdUsers.length} Time Doctor users to Team Members`);
   return matchMap;
 }
 
@@ -533,14 +537,15 @@ export async function syncTimeDoctorUsers(
     let matched = 0;
 
     for (const tdUser of tdUsers) {
-      const notionUserId = userMatchMap.get(tdUser.id);
+      // teamMemberPageId is the Team Member page ID (notion_id from team_members collection)
+      const teamMemberPageId = userMatchMap.get(tdUser.id);
       
       await db.collection('timedoctor_users').updateOne(
         { time_doctor_id: tdUser.id },
         {
           $set: {
             time_doctor_id: tdUser.id,
-            notion_user_id: notionUserId,
+            team_member_page_id: teamMemberPageId, // Team Member page ID
             name: tdUser.name,
             email: tdUser.email,
             role: tdUser.role,
@@ -555,7 +560,7 @@ export async function syncTimeDoctorUsers(
       );
 
       processed++;
-      if (notionUserId) matched++;
+      if (teamMemberPageId) matched++;
     }
 
     console.log(`[TIMEDOCTOR] Synced ${processed} users, ${matched} matched to Notion`);
@@ -817,7 +822,8 @@ export async function syncTimeDoctorWorklogs(
     const tdUser = tdUsers.find((u: any) => u.time_doctor_id === worklog.userId);
     const tdProject = tdProjects.find((p: any) => p.time_doctor_id === worklog.projectId);
     
-    const notionUserId = tdUser?.notion_user_id;
+    // teamMemberPageId is the Team Member page ID (from team_members collection)
+    const teamMemberPageId = tdUser?.team_member_page_id;
     let notionCardId = tdProject?.notion_card_id;
     let notionClientId = tdProject?.notion_client_id;
 
@@ -860,7 +866,7 @@ export async function syncTimeDoctorWorklogs(
     // Store hours as decimal (same as Pipedream workflow: hours = time / 3600)
     const hours = worklog.time / 3600; // Direct decimal conversion from seconds to hours
     const minutes = (worklog.time % 3600) / 60; // Keep minutes for backward compatibility (not used in calculations)
-    const hourlyRate = notionUserId ? (hourlyRateMap.get(notionUserId) || 0) : 0;
+    const hourlyRate = teamMemberPageId ? (hourlyRateMap.get(teamMemberPageId) || 0) : 0;
     const cost = hours * hourlyRate; // Use decimal hours for cost calculation
 
     // Time Doctor uses UTC-05:00 (America/New_York) timezone
@@ -909,7 +915,7 @@ export async function syncTimeDoctorWorklogs(
       },
       {
         $set: {
-          notion_user_id: notionUserId,
+          team_member_page_id: teamMemberPageId,
           notion_card_id: notionCardId,
           notion_client_id: notionClientId,
           hours,
@@ -934,7 +940,7 @@ export async function syncTimeDoctorWorklogs(
 
     // Count as processed (we already validated before saving)
     processed++;
-    if (notionUserId && notionCardId) matched++;
+    if (teamMemberPageId && notionCardId) matched++;
   }
 
   console.log(`[TIMEDOCTOR] Processed ${processed} valid worklogs, ${matched} matched to Notion`);

@@ -37,10 +37,10 @@ export async function fetchAllPages(
     } else {
       allPages.push(...response.results);
     }
-    
+
     cursor = response.has_more && response.next_cursor ? response.next_cursor : undefined;
     pageCount++;
-    
+
     console.log(`[NOTION API] Fetched page ${pageCount}, total pages so far: ${allPages.length}${limit ? ` (limit: ${limit})` : ''}`);
 
     // Stop if we hit the limit
@@ -62,12 +62,12 @@ export async function fetchAllPages(
 export function extractProperty(page: any, propertyId: string, propertyType: string, propertyName?: string): any {
   // Try by ID first
   let prop = page.properties[propertyId];
-  
+
   // If not found by ID and name is provided, try by name
   if (!prop && propertyName) {
     prop = page.properties[propertyName];
   }
-  
+
   if (!prop) return null;
 
   switch (propertyType) {
@@ -116,12 +116,12 @@ export function extractProperty(page: any, propertyId: string, propertyType: str
       if (prop.rollup?.type === 'number') {
         return prop.rollup.number;
       } else if (prop.rollup?.type === 'array') {
-        // For arrays, check if it contains people - if so, extract IDs
+        // For arrays, check if it contains people, relations, or other data - if so, extract IDs
         const array = prop.rollup.array || [];
         if (array.length > 0) {
           // Check if array items are people objects (for show_original rollups)
           const firstItem = array[0];
-          
+
           // Case 1: Items have type 'people' and contain a people property with array
           if (firstItem?.type === 'people' && firstItem.people) {
             // Rollup with show_original - each item has type 'people' and a people array
@@ -132,14 +132,34 @@ export function extractProperty(page: any, propertyId: string, propertyType: str
               return [];
             }).filter((id: any) => id) || [];
           }
-          
-          // Case 2: Items are people objects directly (each item IS a person)
-          if (firstItem?.object === 'user' || firstItem?.id) {
+
+          // Case 2: Items have type 'relation' and contain a relation property with array
+          // This handles rollups from relation properties (like Account Manager which is a rollup of Client's AM relation)
+          if (firstItem?.type === 'relation' && firstItem.relation) {
+            // console.log('[DEBUG] Relation Rollup Item:', JSON.stringify(firstItem));
+            // Rollup with show_original on relation - each item has type 'relation' and a relation array
+            return array.flatMap((item: any) => {
+              // Check if relation is an array
+              if (item.relation && Array.isArray(item.relation)) {
+                return item.relation.map((r: any) => r.id).filter((id: any) => id);
+              }
+              return [];
+            }).filter((id: any) => id) || [];
+          }
+
+          // Case 3: Items are people objects directly (each item IS a person)
+          if (firstItem?.object === 'user' || (firstItem?.id && firstItem?.type === undefined)) {
             // Direct person objects in the array
             return array.map((item: any) => item.id).filter((id: any) => id) || [];
           }
-          
-          // Case 3: Items might have nested structure - try to find people IDs
+
+          // Case 4: Items are relation objects directly
+          if (firstItem?.id && !firstItem?.object) {
+            // Direct relation IDs in the array (simple relation structure)
+            return array.map((item: any) => item.id).filter((id: any) => id) || [];
+          }
+
+          // Case 5: Items might have nested structure - try to find people IDs
           if (firstItem?.people) {
             // Each array item has a people property (could be single person or array)
             return array.flatMap((item: any) => {

@@ -75,23 +75,23 @@ export async function POST(request: NextRequest) {
     // Handle page deletion/archival
     if (eventType === 'page.removed_from_database' || eventType === 'page.deleted' || (page && (page.archived || page.in_trash))) {
       console.log(`[WEBHOOK] Page ${pageId} removed/deleted/archived - marking as archived`);
-      
+
       // Mark as archived instead of deleting
       await db.collection('cards').updateOne(
         { notion_id: pageId },
-        { 
-          $set: { 
+        {
+          $set: {
             status: '♻️ Archive',
             updated_at: new Date(),
             last_synced_at: new Date(),
-          } 
+          }
         }
       );
 
-      return NextResponse.json({ 
-        success: true, 
+      return NextResponse.json({
+        success: true,
         message: 'Page marked as archived',
-        page_id: pageId 
+        page_id: pageId
       });
     }
 
@@ -106,15 +106,15 @@ export async function POST(request: NextRequest) {
         } else {
           console.log(`[WEBHOOK] Using page data from webhook payload for ${pageId}`);
         }
-        
+
         // Type guard: Check if this is a full page object (not a partial response)
         // Full page objects have 'object' === 'page' and 'properties' field
         if (page.object !== 'page' || !('properties' in page)) {
           console.log(`[WEBHOOK] Page ${pageId} is not a full page object or not a database page, skipping`);
-          return NextResponse.json({ 
-            success: true, 
+          return NextResponse.json({
+            success: true,
             message: 'Not a database page, skipped',
-            page_id: pageId 
+            page_id: pageId
           });
         }
 
@@ -122,7 +122,7 @@ export async function POST(request: NextRequest) {
         const projectsDbId = process.env.NOTION_PROJECTS_DB_ID;
         if (page.parent && projectsDbId) {
           let parentDbId: string | null = null;
-          
+
           // Handle different parent formats
           if ('type' in page.parent) {
             if (page.parent.type === 'database_id' && 'database_id' in page.parent) {
@@ -132,33 +132,34 @@ export async function POST(request: NextRequest) {
               parentDbId = page.parent.database_id;
             }
           }
-          
+
           if (parentDbId) {
             // Normalize database IDs by removing hyphens for comparison
             // Notion sometimes returns IDs with or without hyphens
             const normalizeId = (id: string) => id.replace(/-/g, '').toLowerCase();
             const normalizedParentId = normalizeId(parentDbId);
             const normalizedProjectsId = normalizeId(projectsDbId);
-            
+
             if (normalizedParentId !== normalizedProjectsId) {
               console.log(`[WEBHOOK] Page ${pageId} is not from Projects database (${parentDbId} vs ${projectsDbId}), skipping`);
-              return NextResponse.json({ 
-                success: true, 
+              return NextResponse.json({
+                success: true,
                 message: 'Not from Projects database, skipped',
-                page_id: pageId 
+                page_id: pageId
               });
             }
           }
         }
 
-        
+
         // Transform the page to our Card format
+        // This automatically handles Team Members  relation properties and resolves IDs to names
         const card = await transformProjectPage(page);
-        
+
         // Get existing card to check if status changed
         const existingCard = await db.collection('cards').findOne({ notion_id: pageId });
         const previousStatus = existingCard?.status;
-        
+
         // Upsert the card in MongoDB
         const result = await db.collection('cards').updateOne(
           { notion_id: card.notion_id },
@@ -179,8 +180,8 @@ export async function POST(request: NextRequest) {
           await recordStatusHistory(card);
         }
 
-        return NextResponse.json({ 
-          success: true, 
+        return NextResponse.json({
+          success: true,
           message: 'Page updated successfully',
           page_id: pageId,
           upserted: result.upsertedCount > 0,
@@ -189,23 +190,23 @@ export async function POST(request: NextRequest) {
 
       } catch (error: any) {
         console.error(`[WEBHOOK] Error processing page ${pageId}:`, error);
-        
+
         // If page doesn't exist or access denied, log but don't fail
         if (error.code === 'object_not_found' || error.status === 404) {
           console.log(`[WEBHOOK] Page ${pageId} not found in Notion, may have been deleted`);
-          return NextResponse.json({ 
-            success: true, 
+          return NextResponse.json({
+            success: true,
             message: 'Page not found (may have been deleted)',
-            page_id: pageId 
+            page_id: pageId
           });
         }
 
         // Return error but don't fail the webhook (Notion will retry)
         return NextResponse.json(
-          { 
-            success: false, 
+          {
+            success: false,
             error: error.message,
-            page_id: pageId 
+            page_id: pageId
           },
           { status: 500 }
         );
@@ -214,18 +215,18 @@ export async function POST(request: NextRequest) {
 
     // Handle other event types (acknowledge but don't process)
     console.log(`[WEBHOOK] Unhandled event type: ${eventType}`);
-    return NextResponse.json({ 
-      success: true, 
+    return NextResponse.json({
+      success: true,
       message: 'Event type not processed',
-      event_type: eventType 
+      event_type: eventType
     });
 
   } catch (error: any) {
     console.error('[WEBHOOK] Webhook processing error:', error);
     return NextResponse.json(
-      { 
-        success: false, 
-        error: error.message 
+      {
+        success: false,
+        error: error.message
       },
       { status: 500 }
     );
@@ -236,7 +237,7 @@ export async function POST(request: NextRequest) {
  * GET endpoint for webhook verification/testing
  */
 export async function GET() {
-  return NextResponse.json({ 
+  return NextResponse.json({
     message: 'Notion webhook endpoint is active',
     endpoint: '/api/webhooks/notion',
     method: 'POST',

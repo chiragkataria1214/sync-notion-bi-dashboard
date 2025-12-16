@@ -6,9 +6,129 @@ import type { Card, TeamMember, CardStatusHistory, SyncLog, Client } from '@/lib
 const PROJECTS_DB_ID = process.env.NOTION_PROJECTS_DB_ID!;
 const TEAM_MEMBERS_DB_ID = process.env.NOTION_TEAM_MEMBERS_DB_ID!;
 const CLIENTS_DB_ID = 'c844e95e-2960-43da-8a65-15ce0c7eba53'; // Client database ID
+const PUBLIC_TEAM_DIRECTORY_DB_ID = '2c89ca8d-b0d7-801a-99af-cebdd39031d9';
+const PRIVATE_PROFILE_PROPERTY_ID = '%3EZ%3AQ';
 
 // Debug flag for logging page structure once
 let hasLoggedPageStructure = false;
+
+/**
+ * Fetch a map of Public Team Directory Page IDs to Private Team Member Page IDs
+ */
+async function getPublicToPrivateMap(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    console.log('[SYNC] Fetching Public Team Directory for ID resolution...');
+    // We only need the Private Profile relation property
+    const pages = await fetchAllPages(PUBLIC_TEAM_DIRECTORY_DB_ID);
+    console.log(`[SYNC] Fetched ${pages.length} pages from Public Team Directory`);
+
+    for (const page of pages) {
+      const privateProfile = extractProperty(page, PRIVATE_PROFILE_PROPERTY_ID, 'relation', '🔒 Private Profile');
+
+      // LOGGING FOR DEBUGGING
+      if (hasLoggedPageStructure === false) {
+        console.log('[DEBUG] Public Directory Page Structure:', JSON.stringify(page, null, 2));
+        console.log('[DEBUG] Extracted Private Profile:', privateProfile);
+        hasLoggedPageStructure = true;
+      }
+
+      if (privateProfile && Array.isArray(privateProfile) && privateProfile.length > 0) {
+        // extractProperty for 'relation' returns an array of page IDs
+        const privateId = privateProfile[0];
+        if (privateId) {
+          map.set(page.id, privateId);
+          // Also map with hyphens removed/added to be safe? 
+          // Notion IDs are consistent enough usually, but let's stick to raw IDs first.
+        }
+      }
+    }
+    console.log(`[SYNC] Built Public->Private ID map with ${map.size} entries`);
+  } catch (error: any) {
+    console.warn(`[SYNC] Failed to build Public Team Directory map: ${error.message}`);
+  }
+  return map;
+}
+
+/**
+ * Resolve a list of potentially Public Directory IDs to Private Team Member IDs
+ */
+async function resolveMemberIds(ids: string[], publicToPrivateMap?: Map<string, string>): Promise<string[]> {
+  if (!ids || ids.length === 0) return [];
+
+  const resolvedIds: string[] = [];
+
+  for (const id of ids) {
+    // 1. Try to look up in the provided map (Fastest, used in batch sync)
+    if (publicToPrivateMap && publicToPrivateMap.has(id)) {
+      resolvedIds.push(publicToPrivateMap.get(id)!);
+      continue;
+    }
+
+    // 2. If no map or not in map, check if we need to resolve it on the fly (Webhook / Fallback)
+    // We only try to fetch if we don't have a map (to distinguish between "not found in map" and "map not loaded")
+    // OR if we want to be very robust, we could try fetching even if map exists but key missing (costly)
+    // For now, if map is provided, we assume it's complete enough. 
+    // If map is NOT provided (webhook), we fetch.
+    if (!publicToPrivateMap) {
+      try {
+        const page = await notion.pages.retrieve({ page_id: id });
+
+        // Debug
+        // console.log(`[RESOLVE] Fetched page ${id} from Notion to check for private profile`);
+
+        if ('properties' in page) {
+          // Check if this page has the Private Profile property
+          const privateProfile = extractProperty(page, PRIVATE_PROFILE_PROPERTY_ID, 'relation', '🔒 Private Profile');
+
+          if (privateProfile && Array.isArray(privateProfile) && privateProfile.length > 0) {
+            // It's a Public Directory page, use the Private ID
+            // console.log(`[RESOLVE] Resolved Public ID ${id} -> Private ID ${privateProfile[0]}`);
+            resolvedIds.push(privateProfile[0]);
+          } else {
+            // It doesn't have the property, assume it's already a Private ID (or other) and keep as is
+            // console.log(`[RESOLVE] ID ${id} had no private profile relation, keeping original`);
+            resolvedIds.push(id);
+          }
+        }
+      } catch (error) {
+        // If fetch fails (e.g. permission or not found), keep original ID
+        resolvedIds.push(id);
+      }
+    } else {
+      // Map provided but ID not found -> Assume it's already a Private ID
+      resolvedIds.push(id);
+    }
+  }
+
+  // Deduplicate
+  return Array.from(new Set(resolvedIds));
+}
+
+/**
+ * Resolve Team Member page IDs to team member names
+ * Takes Team Member page IDs from TM relation properties and looks them up in the team_members collection
+ */
+async function resolveTeamMemberIds(ids: string[], db: any): Promise<string[]> {
+  if (!ids || ids.length === 0) return [];
+
+  const names: string[] = [];
+
+  for (const id of ids) {
+    try {
+      // Find by notion_id (Team Member page ID)
+      const teamMember = await db.collection('team_members').findOne({ notion_id: id });
+
+      if (teamMember && teamMember.name) {
+        names.push(teamMember.name);
+      }
+    } catch (error: any) {
+      console.warn(`[EXTRACTOR] Could not resolve team member ID ${id}:`, error.message);
+    }
+  }
+
+  return names;
+}
 
 /**
  * Convert a property name to a clean, query-friendly snake_case name
@@ -29,7 +149,7 @@ function normalizePropertyName(name: string): string {
  * Transform a Client page from Notion to our database format
  * Extracts ALL properties from the client page and stores them with clean, query-friendly names
  */
-function transformClientPage(page: any): Client {
+async function transformClientPage(page: any, publicToPrivateMap?: Map<string, string>): Promise<Client> {
   const notionId = page.id;
 
   // Extract name (use "Name" property - it's a title field with id "title")
@@ -98,6 +218,27 @@ function transformClientPage(page: any): Client {
     metadata.type = clientType;
   }
 
+  // Resolve Team Member IDs to names for easier querying
+  // AND resolve Public IDs to Private IDs first!
+  const db = await getDb();
+  const teamMemberFields = ['developer', 'lead_developer', 'account_manager', 'quality_inspector'];
+
+  for (const field of teamMemberFields) {
+    if (metadata[field] && Array.isArray(metadata[field]) && metadata[field].length > 0) {
+      // 1. Resolve to Private IDs (Team Member Page IDs) instead of Public Directory IDs
+      const resolvedIds = await resolveMemberIds(metadata[field], publicToPrivateMap);
+
+      // Update the metadata with the correct private IDs
+      metadata[field] = resolvedIds;
+
+      // 2. Resolve to Names using the Private IDs
+      const teamMemberNames = await resolveTeamMemberIds(resolvedIds, db);
+      if (teamMemberNames.length > 0) {
+        metadata[`${field}_names`] = teamMemberNames;
+      }
+    }
+  }
+
   return {
     notion_id: notionId,
     name,
@@ -129,12 +270,15 @@ export async function syncClients(): Promise<SyncLog> {
   try {
     console.log('Starting clients sync...');
 
+    // Fetch Public -> Private map for ID resolution
+    const publicToPrivateMap = await getPublicToPrivateMap();
+
     const pages = await fetchAllPages(CLIENTS_DB_ID);
     console.log(`[SYNC] Fetched ${pages.length} clients from Notion`);
 
     for (const page of pages) {
       try {
-        const client = transformClientPage(page);
+        const client = await transformClientPage(page, publicToPrivateMap);
 
         await db.collection('clients').updateOne(
           { notion_id: client.notion_id },
@@ -233,6 +377,12 @@ export async function syncProjects(clientId?: string, limit?: number): Promise<S
   try {
     console.log(`Starting projects sync${clientId ? ` for client: ${clientId}` : ' (all clients)'}${limit ? ` (limit: ${limit})` : ''}...`);
 
+    // Fetch Public -> Private map for ID resolution
+    // Only fetch if we're doing a full sync or enough volume to justify it
+    // For single client sync, we might skip this optimization if we had per-ID resolution, 
+    // but the map build is relatively cheap (e.g. 50-100 entries) compared to N API calls
+    const publicToPrivateMap = await getPublicToPrivateMap();
+
     // Build Notion query filter
     let notionFilter: any = undefined;
     let retiredClients: Set<string> = new Set();
@@ -298,7 +448,7 @@ export async function syncProjects(clientId?: string, limit?: number): Promise<S
 
       for (const page of batch) {
         try {
-          const card = await transformProjectPage(page);
+          const card = await transformProjectPage(page, publicToPrivateMap);
 
           // console.log(`[DEBUG] Card transformed for ${card.notion_id}: client_id=${card.client_id}, client_name=${card.client_name}`);
 
@@ -440,7 +590,7 @@ export async function syncTeamMembers(): Promise<SyncLog> {
   }
 }
 
-export async function transformProjectPage(page: any): Promise<Card> {
+export async function transformProjectPage(page: any, publicToPrivateMap?: Map<string, string>): Promise<Card> {
   const notionId = page.id;
 
   // Extract title (try both ID and name)
@@ -459,24 +609,72 @@ export async function transformProjectPage(page: any): Promise<Card> {
   const readyForClientDate = extractProperty(page, PROJECT_PROPERTIES.READY_FOR_CLIENT_DATE.id, PROJECT_PROPERTIES.READY_FOR_CLIENT_DATE.type, PROJECT_PROPERTIES.READY_FOR_CLIENT_DATE.name);
   const deploymentDate = extractProperty(page, PROJECT_PROPERTIES.DEPLOYMENT_DATE.id, PROJECT_PROPERTIES.DEPLOYMENT_DATE.type, PROJECT_PROPERTIES.DEPLOYMENT_DATE.name);
 
-  // Extract people (developer, lead developer, account manager, quality inspector, designer)
-  const developer = extractProperty(page, PROJECT_PROPERTIES.DEVELOPER.id, PROJECT_PROPERTIES.DEVELOPER.type, PROJECT_PROPERTIES.DEVELOPER.name);
-  const leadDeveloper = extractProperty(page, PROJECT_PROPERTIES.LEAD_DEVELOPER.id, PROJECT_PROPERTIES.LEAD_DEVELOPER.type, PROJECT_PROPERTIES.LEAD_DEVELOPER.name);
-  const accountManager = extractProperty(page, PROJECT_PROPERTIES.ACCOUNT_MANAGER.id, PROJECT_PROPERTIES.ACCOUNT_MANAGER.type, PROJECT_PROPERTIES.ACCOUNT_MANAGER.name);
-  const qualityInspector = extractProperty(page, PROJECT_PROPERTIES.QUALITY_INSPECTOR.id, PROJECT_PROPERTIES.QUALITY_INSPECTOR.type, PROJECT_PROPERTIES.QUALITY_INSPECTOR.name);
-  const designer = extractProperty(page, PROJECT_PROPERTIES.DESIGNER.id, PROJECT_PROPERTIES.DESIGNER.type, PROJECT_PROPERTIES.DESIGNER.name);
+  // Extract relations - Client property (Moved up for dependencies)
+  const client = findClientProperty(page, extractProperty);
+
+  // Extract people - Using Team Members relations (TM)
+  // These IDs might be from Public Team Directory now, so we resolve them to Private IDs
+  const rawDeveloper = extractProperty(page, PROJECT_PROPERTIES.DEVELOPER.id, PROJECT_PROPERTIES.DEVELOPER.type, PROJECT_PROPERTIES.DEVELOPER.name);
+  const developer = await resolveMemberIds(Array.isArray(rawDeveloper) ? rawDeveloper : [], publicToPrivateMap);
+
+  const rawLeadDeveloper = extractProperty(page, PROJECT_PROPERTIES.LEAD_DEVELOPER.id, PROJECT_PROPERTIES.LEAD_DEVELOPER.type, PROJECT_PROPERTIES.LEAD_DEVELOPER.name);
+  const leadDeveloper = await resolveMemberIds(Array.isArray(rawLeadDeveloper) ? rawLeadDeveloper : [], publicToPrivateMap);
+
+  const rawAccountManager = extractProperty(page, PROJECT_PROPERTIES.ACCOUNT_MANAGER.id, PROJECT_PROPERTIES.ACCOUNT_MANAGER.type, PROJECT_PROPERTIES.ACCOUNT_MANAGER.name);
+  if (!rawAccountManager || rawAccountManager.length === 0) {
+    // Check checking via name
+    const amProp = page.properties['Account Manager'];
+    if (amProp) {
+      console.log(`[DEBUG] Account Manager found by name, type: ${amProp.type}, rollup:`, JSON.stringify(amProp.rollup || {}));
+    }
+  }
+  const accountManager = await resolveMemberIds(Array.isArray(rawAccountManager) ? rawAccountManager : [], publicToPrivateMap);
+
+  const rawQualityInspector = extractProperty(page, PROJECT_PROPERTIES.QUALITY_INSPECTOR.id, PROJECT_PROPERTIES.QUALITY_INSPECTOR.type, PROJECT_PROPERTIES.QUALITY_INSPECTOR.name);
+  const qualityInspector = await resolveMemberIds(Array.isArray(rawQualityInspector) ? rawQualityInspector : [], publicToPrivateMap);
+
+  const rawDesigner = extractProperty(page, PROJECT_PROPERTIES.DESIGNER.id, PROJECT_PROPERTIES.DESIGNER.type, PROJECT_PROPERTIES.DESIGNER.name);
+  const designer = await resolveMemberIds(Array.isArray(rawDesigner) ? rawDesigner : [], publicToPrivateMap);
 
   // Debug: Log account manager extraction for troubleshooting
-  if (accountManager && Array.isArray(accountManager) && accountManager.length > 0) {
-    // console.log(`[DEBUG] Account Manager extracted for ${notionId}:`, accountManager);
-  } else if (page.properties?.[PROJECT_PROPERTIES.ACCOUNT_MANAGER.id]) {
+  if ((!accountManager || accountManager.length === 0) && page.properties?.[PROJECT_PROPERTIES.ACCOUNT_MANAGER.id]) {
     const amProp = page.properties[PROJECT_PROPERTIES.ACCOUNT_MANAGER.id];
-    console.log(`[DEBUG] Account Manager property exists but extraction failed. Structure:`, {
-      type: amProp.type,
-      rollup_type: amProp.rollup?.type,
-      rollup_array_length: amProp.rollup?.array?.length,
-      first_item: amProp.rollup?.array?.[0]
-    });
+    //  console.log(`[DEBUG] Account Manager (TM) property exists but extraction failed/empty. Structure:`, {
+    //    type: amProp.type,
+    //    rollup_type: amProp.rollup?.type,
+    //    rollup_array_length: amProp.rollup?.array?.length,
+    //    first_item: amProp.rollup?.array?.[0]
+    //  });
+  }
+
+  // FALLBACK: If Account Manager (Rollup) is empty, try to fetch it from the Client page directly
+  // This handles cases where the Rollup might be broken or pointing to the wrong property
+  if ((!accountManager || accountManager.length === 0) && client && client.length > 0) {
+    try {
+      const clientId = client[0];
+      // console.log(`[SYNC] AM Rollup empty, fetching Client page ${clientId} to find Account Manager...`);
+      const clientPage = await notion.pages.retrieve({ page_id: clientId });
+
+      if ('properties' in clientPage) {
+        // Try to find Account Manager on the client page
+        // Try common names: "Account Manager", "Account Manager (Public)", "AM"
+        const rawClientAM = extractProperty(clientPage, 'Account Manager', 'relation', 'Account Manager') ||
+          extractProperty(clientPage, 'Account Manager (Public)', 'relation', 'Account Manager (Public)') ||
+          extractProperty(clientPage, 'AM', 'relation', 'AM');
+
+        if (rawClientAM && Array.isArray(rawClientAM) && rawClientAM.length > 0) {
+          console.log(`[SYNC] Found Account Manager on Client page: ${rawClientAM}`);
+          // Resolve these IDs (they are likely Public IDs)
+          const resolvedClientAM = await resolveMemberIds(rawClientAM, publicToPrivateMap);
+          if (resolvedClientAM.length > 0) {
+            // Push these found IDs to our primary accountManager array
+            accountManager.push(...resolvedClientAM);
+          }
+        }
+      }
+    } catch (error) {
+      // console.warn(`[SYNC] Failed to fallback fetch Account Manager from Client:`, error);
+    }
   }
 
   // Extract pushback counts
@@ -503,9 +701,8 @@ export async function transformProjectPage(page: any): Promise<Card> {
   const timeDoctorProjectId = extractProperty(page, PROJECT_PROPERTIES.TIME_DOCTOR_PROJECT_ID.id, PROJECT_PROPERTIES.TIME_DOCTOR_PROJECT_ID.type, PROJECT_PROPERTIES.TIME_DOCTOR_PROJECT_ID.name);
   const timeDoctorClientProjectId = extractProperty(page, PROJECT_PROPERTIES.TIME_DOCTOR_CLIENT_PROJECT_ID.id, PROJECT_PROPERTIES.TIME_DOCTOR_CLIENT_PROJECT_ID.type, PROJECT_PROPERTIES.TIME_DOCTOR_CLIENT_PROJECT_ID.name);
 
-  // Extract relations - Client property using robust detection
-  // Using centralized property configuration for maintainability
-  const client = findClientProperty(page, extractProperty);
+  // Client property extraction moved up
+  // Debug logic for client follows:
 
   // Debug: Check if property exists at all
   if (!client || client.length === 0) {
@@ -762,20 +959,51 @@ export async function transformProjectPage(page: any): Promise<Card> {
     extractedProperties.qi_time_tracker_entry_ids = allQITimeTrackerEntries;
   }
 
+  // Always store arrays, even if empty, for consistency
+  extractedProperties.developer_ids = (developer && Array.isArray(developer)) ? developer : [];
+  extractedProperties.lead_developer_ids = (leadDeveloper && Array.isArray(leadDeveloper)) ? leadDeveloper : [];
+  extractedProperties.account_manager_ids = (accountManager && Array.isArray(accountManager)) ? accountManager : [];
+  extractedProperties.quality_inspector_ids = (qualityInspector && Array.isArray(qualityInspector)) ? qualityInspector : [];
+  extractedProperties.designer_ids = (designer && Array.isArray(designer)) ? designer : [];
+
+  // Enrich with team member names for easier querying
+  // These IDs might be Team Member page IDs (from TM relations) or Notion User IDs (from legacy people properties)
+  // We'll try to resolve them to names
+  const db = await getDb();
+
   if (developer && Array.isArray(developer) && developer.length > 0) {
-    extractedProperties.developer_ids = developer;
+    const teamMemberNames = await resolveTeamMemberIds(developer, db);
+    if (teamMemberNames.length > 0) {
+      extractedProperties.developer_names = teamMemberNames;
+    }
   }
+
   if (leadDeveloper && Array.isArray(leadDeveloper) && leadDeveloper.length > 0) {
-    extractedProperties.lead_developer_ids = leadDeveloper;
+    const teamMemberNames = await resolveTeamMemberIds(leadDeveloper, db);
+    if (teamMemberNames.length > 0) {
+      extractedProperties.lead_developer_names = teamMemberNames;
+    }
   }
+
   if (accountManager && Array.isArray(accountManager) && accountManager.length > 0) {
-    extractedProperties.account_manager_ids = accountManager;
+    const teamMemberNames = await resolveTeamMemberIds(accountManager, db);
+    if (teamMemberNames.length > 0) {
+      extractedProperties.account_manager_names = teamMemberNames;
+    }
   }
+
   if (qualityInspector && Array.isArray(qualityInspector) && qualityInspector.length > 0) {
-    extractedProperties.quality_inspector_ids = qualityInspector;
+    const teamMemberNames = await resolveTeamMemberIds(qualityInspector, db);
+    if (teamMemberNames.length > 0) {
+      extractedProperties.quality_inspector_names = teamMemberNames;
+    }
   }
+
   if (designer && Array.isArray(designer) && designer.length > 0) {
-    extractedProperties.designer_ids = designer;
+    const teamMemberNames = await resolveTeamMemberIds(designer, db);
+    if (teamMemberNames.length > 0) {
+      extractedProperties.designer_names = teamMemberNames;
+    }
   }
 
   if (timeDoctorProjectId) {
@@ -798,6 +1026,12 @@ export async function transformProjectPage(page: any): Promise<Card> {
 
       const propName = property.name || propKey;
       const cleanFieldName = normalizePropertyName(propName);
+
+      // Skip old people properties (we only use TM rollup properties now)
+      const oldPeopleProperties = ['Developer', 'Lead Developer', 'Quality Inspector', 'Designer', 'Account Manager'];
+      if (oldPeopleProperties.includes(propName)) {
+        continue;
+      }
 
       // Skip if we already have this field (avoid duplicates with extracted properties above)
       // Also skip "Days Late" and "Late?" as they're handled explicitly above
@@ -855,50 +1089,10 @@ export async function transformProjectPage(page: any): Promise<Card> {
     extractedProperties.client_name_duplicate = client_name;
   }
 
-  // Store client relation with alternative field name
-  if (client && Array.isArray(client) && client.length > 0) {
-    extractedProperties.client = client; // Alternative to client_ids
-  }
-
-  // Store developer with alternative field name
-  if (developer && Array.isArray(developer) && developer.length > 0) {
-    extractedProperties.developer = developer; // Alternative to developer_ids
-  }
-
-  // Store lead developer with alternative field name
-  if (leadDeveloper && Array.isArray(leadDeveloper) && leadDeveloper.length > 0) {
-    extractedProperties.lead_developer = leadDeveloper; // Alternative to lead_developer_ids
-  }
-
-  // Store account manager with alternative field name
-  if (accountManager && Array.isArray(accountManager) && accountManager.length > 0) {
-    extractedProperties.account_manager = accountManager; // Alternative to account_manager_ids
-  }
-
-  // Store designer with alternative field name
-  if (designer && Array.isArray(designer) && designer.length > 0) {
-    extractedProperties.designer = designer; // Alternative to designer_ids
-  }
-
-  // Store quality inspector with alternative field name
-  if (qualityInspector && Array.isArray(qualityInspector) && qualityInspector.length > 0) {
-    extractedProperties.quality_inspector = qualityInspector; // Alternative to quality_inspector_ids
-  }
-
-  // Store tasks with alternative field name
-  if (tasks && Array.isArray(tasks) && tasks.length > 0) {
-    extractedProperties.tasks = tasks; // Alternative to task_ids
-  }
-
-  // Store all QI time tracker entries with alternative field name
-  if (allQITimeTrackerEntries && Array.isArray(allQITimeTrackerEntries) && allQITimeTrackerEntries.length > 0) {
-    extractedProperties.all_qi_time_tracker_entries = allQITimeTrackerEntries; // Alternative to qi_time_tracker_entry_ids
-  }
-
-  // Store Time Doctor project ID with alternative field name
-  if (timeDoctorProjectId) {
-    extractedProperties.time_doctor_project_id = timeDoctorProjectId; // Alternative to time_doctor_task_id
-  }
+  // Note: We DON'T store alternative field names here anymore
+  // The automatic property extraction loop (lines 789-900) already extracts ALL properties
+  // including both the explicitly extracted ones above AND the raw Notion properties
+  // This prevents duplicate storage
 
   return {
     notion_id: notionId,
